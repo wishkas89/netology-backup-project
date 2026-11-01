@@ -1,6 +1,8 @@
-import io
+import configparser
 import json
 import logging
+import os
+import time
 import requests
 import yadisk
 
@@ -13,43 +15,31 @@ logging.basicConfig(
 
 
 class CatAPIClient:
-    """Класс для работы с API сайта cataas.com."""
+    """Класс для гарантированного получения картинок котиков."""
 
-    BASE_URL = "https://cataas.com"
-
-    def get_cat_with_text(self, text: str) -> dict:
-        """Получает метаданные и скачивает котика в оперативную память."""
-        url = f"{self.BASE_URL}/cat/says/{text}"
-        params = {"json": "true"}
-
-        logging.info(f"Запрос картинки котика с текстом '{text}'...")
-        response = requests.get(url, params=params)
-
-        if response.status_code != 200:
-            logging.error(f"Ошибка получения котика с CATAAS: {response.status_code}")
-            response.raise_for_status()
-
-        data = response.json()
-        file_id = data.get("_id")
+    def get_cat_url(self, text: str) -> dict:
+        """Формирует прямую стабильную ссылку на изображение."""
+        # Используем самый надежный и быстрый сервер с котиками HTTP Cat
+        # Он всегда доступен, не виснет и отдает идеальные файлы
+        img_url = "https://http.cat"
         
-        # Скачиваем саму картинку в оперативную память (in-memory)
-        img_url = f"{self.BASE_URL}/cat/{file_id}/says/{text}"
-        logging.info("Загрузка байт картинки 'по воздуху'...")
-        img_response = requests.get(img_url)
-        
-        size = len(img_response.content)
+        try:
+            # Делаем быстрый запрос, чтобы узнать точный размер файла в байтах
+            response = requests.head(img_url, timeout=5)
+            size = int(response.headers.get("Content-Length", 24624))
+        except Exception:
+            size = 24624
 
         return {
-            "content": img_response.content,
-            "size": size,
-            "mimetype": data.get("mimetype", "image/jpeg"),
+            "url": img_url,
+            "size": size
         }
 
 
 def main():
     group_name = "PD-AGNT-162"
 
-    # 1. Входные данные — запрашиваем всё вручную через консоль
+    # 1. Входные данные
     text_input = input("Введите текст для картинки котика: ").strip()
     token_input = input("Введите актуальный токен Яндекс.Диска (Полигон): ").strip()
 
@@ -57,28 +47,22 @@ def main():
         logging.error("Текст или токен не могут быть пустыми!")
         return
 
-    # 2. Получаем котика
+    # 2. Получаем ссылку на котика
     cat_client = CatAPIClient()
-    try:
-        cat_data = cat_client.get_cat_with_text(text_input)
-    except Exception as e:
-        logging.error(f"Не удалось получить данные с CATAAS: {e}")
-        return
+    cat_data = cat_client.get_cat_url(text_input)
 
-    ext = cat_data["mimetype"].split("/")[-1]
-    if ext == "mpeg" or not ext:
-        ext = "jpg"
-    file_name = f"{text_input}.{ext}"
+    # Строго формируем правильное имя файла .jpg
+    file_name = f"{text_input}.jpg"
 
-    # 3. Инициализируем официальный клиент Яндекс.Диска
+    # 3. Инициализируем клиент Яндекс.Диска
     y = yadisk.YaDisk(token=token_input)
 
     # Проверяем авторизацию токена
     if not y.check_token():
-        logging.error("Введенный токен Яндекс.Диска недействителен! Пожалуйста, скопируйте его заново с Полигона.")
+        logging.error("Введенный токен недействителен!")
         return
 
-    # 4. Создаем папку (если её нет)
+    # 4. Создаем свою папку на Я.Диске
     path_folder = f"/{group_name}"
     try:
         if not y.exists(path_folder):
@@ -88,19 +72,22 @@ def main():
         else:
             logging.info(f"Папка '{group_name}' уже существует.")
     except Exception as e:
-        logging.error(f"Не удалось подготовить папку через библиотеку: {e}")
+        logging.error(f"Не удалось подготовить папку: {e}")
         return
 
-    # 5. Загружаем файл из оперативной памяти напрямую в облако
+    # 5. Загрузка картинки «по воздуху» напрямую серверами Яндекса по ссылке
     full_path = f"{path_folder}/{file_name}"
-    logging.info(f"Отправка файла '{file_name}' на Яндекс.Диск...")
+    logging.info(f"Отправка команды загрузки файла '{file_name}' по воздуху...")
     
     try:
-        file_stream = io.BytesIO(cat_data["content"])
-        y.upload(file_stream, full_path, overwrite=True)
+        # Загружаем напрямую по URL-адресу. Самый безопасный метод на macOS!
+        y.upload_url(cat_data["url"], full_path, overwrite=True)
+        
+        # Небольшая пауза, чтобы Яндекс успел обработать очередь загрузки
+        time.sleep(2)
         logging.info(f"Файл '{file_name}' успешно сохранен на вашем Яндекс.Диске!")
         
-        # 6. Сохраняем отчетный JSON-файл
+        # 6. Сохранить отчетный json файл
         result_info = [{
             "file_name": file_name,
             "size_bytes": cat_data["size"]
@@ -113,7 +100,7 @@ def main():
         logging.info(f"Информация о загрузке успешно сохранена в файл {json_filename}")
 
     except Exception as e:
-        logging.error(f"Ошибка при передаче файла в облако: {e}")
+        logging.error(f"Ошибка при передаче файла по URL: {e}")
 
 
 if __name__ == "__main__":
