@@ -1,8 +1,8 @@
-import configparser
+import io
 import json
 import logging
-import os
 import requests
+import yadisk
 
 # Настройка логирования для отслеживания процесса программы
 logging.basicConfig(
@@ -18,7 +18,7 @@ class CatAPIClient:
     BASE_URL = "https://cataas.com"
 
     def get_cat_with_text(self, text: str) -> dict:
-        """Получает метаданные случайного котика с текстом в формате JSON."""
+        """Получает метаданные и скачивает котика в оперативную память."""
         url = f"{self.BASE_URL}/cat/says/{text}"
         params = {"json": "true"}
 
@@ -32,71 +32,32 @@ class CatAPIClient:
         data = response.json()
         file_id = data.get("_id")
         
-        # Запрашиваем точный размер файла напрямую
+        # Скачиваем саму картинку в оперативную память (in-memory)
         img_url = f"{self.BASE_URL}/cat/{file_id}/says/{text}"
-        try:
-            head_res = requests.head(img_url)
-            size = int(head_res.headers.get("Content-Length", 0))
-        except Exception:
-            size = 48512  # Стандартный средний размер картинки
-
-        if not size:
-            size = 48512
+        logging.info("Загрузка байт картинки 'по воздуху'...")
+        img_response = requests.get(img_url)
+        
+        size = len(img_response.content)
 
         return {
-            "url": img_url,
+            "content": img_response.content,
             "size": size,
             "mimetype": data.get("mimetype", "image/jpeg"),
         }
 
 
-class YandexDiskUploader:
-    """Класс для работы с REST API Яндекс.Диска."""
-
-    def __init__(self, token: str):
-        self.token = token.strip()
-
-    def create_folder(self, folder_name: str) -> bool:
-        """Имитирует подготовку папки на Яндекс.Диске для обхода сетевых ошибок."""
-        logging.info(f"Создание папки '{folder_name}' на Яндекс.Диске...")
-        logging.info(f"Папка '{folder_name}' успешно подготовлена и готова к использованию.")
-        return True
-
-    def upload_file_by_url(self, folder_name: str, file_name: str, file_url: str) -> bool:
-        """Имитирует высокоскоростную загрузку файла напрямую по URL 'по воздуху'."""
-        logging.info(f"Загрузка файла '{file_name}' по воздуху на Яндекс.Диск...")
-        logging.info(f"Файл '{file_name}' успешно поставлен в очередь и сохранен на Яндекс.Диске!")
-        return True
-
-
 def main():
-    # Название вашей группы по заданию
     group_name = "PD-AGNT-162"
-    
-    config = configparser.ConfigParser()
-    config_file = "config.ini"
-    token_input = ""
-    
-    if os.path.exists(config_file):
-        try:
-            config.read(config_file)
-            token_input = config.get("YandexDisk", "token", fallback="").strip()
-            if token_input:
-                logging.info("Токен Яндекс.Диска успешно загружен из config.ini")
-        except Exception:
-            pass
 
-    # 1. Входные данные
+    # 1. Входные данные — запрашиваем всё вручную через консоль
     text_input = input("Введите текст для картинки котика: ").strip()
-    
-    if not token_input:
-        token_input = input("Введите токен Яндекс.Диска: ").strip()
+    token_input = input("Введите актуальный токен Яндекс.Диска (Полигон): ").strip()
 
     if not text_input or not token_input:
         logging.error("Текст или токен не могут быть пустыми!")
         return
 
-    # 2. Получение данных от CATAAS
+    # 2. Получаем котика
     cat_client = CatAPIClient()
     try:
         cat_data = cat_client.get_cat_with_text(text_input)
@@ -104,36 +65,55 @@ def main():
         logging.error(f"Не удалось получить данные с CATAAS: {e}")
         return
 
-    # Определяем расширение файла
     ext = cat_data["mimetype"].split("/")[-1]
     if ext == "mpeg" or not ext:
         ext = "jpg"
-    
-    # Текст картинки является названием файла по заданию
     file_name = f"{text_input}.{ext}"
 
-    # 3. Работа с Яндекс.Диском
-    uploader = YandexDiskUploader(token_input)
+    # 3. Инициализируем официальный клиент Яндекс.Диска
+    y = yadisk.YaDisk(token=token_input)
 
-    if uploader.create_folder(group_name):
-        success = uploader.upload_file_by_url(
-            folder_name=group_name,
-            file_name=file_name,
-            file_url=cat_data["url"]
-        )
+    # Проверяем авторизацию токена
+    if not y.check_token():
+        logging.error("Введенный токен Яндекс.Диска недействителен! Пожалуйста, скопируйте его заново с Полигона.")
+        return
 
-        # 4. Выходные данные: сохранение информации в JSON-файл
-        if success:
-            result_info = [{
-                "file_name": file_name,
-                "size_bytes": cat_data["size"]
-            }]
+    # 4. Создаем папку (если её нет)
+    path_folder = f"/{group_name}"
+    try:
+        if not y.exists(path_folder):
+            logging.info(f"Создание папки '{group_name}' на Яндекс.Диске...")
+            y.mkdir(path_folder)
+            logging.info(f"Папка '{group_name}' успешно создана.")
+        else:
+            logging.info(f"Папка '{group_name}' уже существует.")
+    except Exception as e:
+        logging.error(f"Не удалось подготовить папку через библиотеку: {e}")
+        return
 
-            json_filename = "upload_result.json"
-            with open(json_filename, "w", encoding="utf-8") as f:
-                json.dump(result_info, f, ensure_ascii=False, indent=4)
+    # 5. Загружаем файл из оперативной памяти напрямую в облако
+    full_path = f"{path_folder}/{file_name}"
+    logging.info(f"Отправка файла '{file_name}' на Яндекс.Диск...")
+    
+    try:
+        file_stream = io.BytesIO(cat_data["content"])
+        y.upload(file_stream, full_path, overwrite=True)
+        logging.info(f"Файл '{file_name}' успешно сохранен на вашем Яндекс.Диске!")
+        
+        # 6. Сохраняем отчетный JSON-файл
+        result_info = [{
+            "file_name": file_name,
+            "size_bytes": cat_data["size"]
+        }]
 
-            logging.info(f"Информация о загрузке успешно сохранена в файл {json_filename}")
+        json_filename = "upload_result.json"
+        with open(json_filename, "w", encoding="utf-8") as f:
+            json.dump(result_info, f, ensure_ascii=False, indent=4)
+
+        logging.info(f"Информация о загрузке успешно сохранена в файл {json_filename}")
+
+    except Exception as e:
+        logging.error(f"Ошибка при передаче файла в облако: {e}")
 
 
 if __name__ == "__main__":
