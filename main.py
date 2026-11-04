@@ -1,106 +1,196 @@
-import configparser
 import json
 import logging
-import os
-import time
+import sys
 import requests
-import yadisk
+from tqdm import tqdm
 
-# Настройка логирования для отслеживания процесса программы
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
+    handlers=[logging.FileHandler("backup.log", encoding="utf-8")]
 )
 
 
 class CatAPIClient:
-    """Класс для гарантированного получения картинок котиков."""
+    """Класс для работы с API CATAAS (Cat as a Service)."""
+    BASE_URL = "https://cataas.com"
 
-    def get_cat_url(self, text: str) -> dict:
-        """Формирует прямую стабильную ссылку на изображение."""
-        # Используем самый надежный и быстрый сервер с котиками HTTP Cat
-        # Он всегда доступен, не виснет и отдает идеальные файлы
-        img_url = "https://http.cat"
-        
+    def __init__(self, timeout=10):
+        self.session = requests.Session()
+        self.timeout = timeout
+
+    def get_cat_url(self, text):
+        """Получает рабочий URL картинки котика с текстом."""
+        url = f"{self.BASE_URL}/cat/says/{text}"
+        params = {"json": "true"}
+
+        logging.info(f"Запрос метаданных котика с текстом: '{text}'")
         try:
-            # Делаем быстрый запрос, чтобы узнать точный размер файла в байтах
-            response = requests.head(img_url, timeout=5)
-            size = int(response.headers.get("Content-Length", 24624))
-        except Exception:
-            size = 24624
+            response = self.session.get(url, params=params, timeout=self.timeout)
+            
+            if response.status_code != 200:
+                logging.warning("JSON API недоступно, переключаемся на прямой URL")
+                return f"{self.BASE_URL}/cat/says/{text}"
+                
+            data = response.json()
+            image_id = data.get("_id") or data.get("id")
+            
+            if not image_id:
+                return f"{self.BASE_URL}/cat/says/{text}"
 
-        return {
-            "url": img_url,
-            "size": size
+            direct_url = f"{self.BASE_URL}/cat/{image_id}/says/{text}"
+            logging.info(f"Получена персистентная ссылка на котика: {direct_url}")
+            return direct_url
+
+        except (requests.exceptions.Timeout, TimeoutError) as err:
+            logging.error(f"Превышено время ожидания ответа от CATAAS API: {err}")
+            return None
+        except requests.exceptions.RequestException as err:
+            logging.error(f"Сетевая ошибка API: {err}. Используем базовый эндпоинт.")
+            return f"{self.BASE_URL}/cat/says/{text}"
+
+
+class YandexDiskUploader:
+    """Класс для взаимодействия с REST API Яндекс.Диска."""
+    BASE_URL = "https://cloud-api.yandex.net/v1/disk"
+
+    def __init__(self, token, timeout=15):
+        self.headers = {
+            "Authorization": f"OAuth {token}",
+            "Accept": "application/json"
         }
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        self.timeout = timeout
+
+    def create_folder(self, folder_name):
+        """Создает папку на Яндекс.Диске через чистый и изолированный PUT-запрос."""
+        url = f"{self.BASE_URL}/resources"
+        params = {"path": folder_name}
+        
+        logging.info(f"Создание папки '{folder_name}' на Я.Диске через изолированный PUT-запрос")
+        try:
+            # Используем прямой requests.put с явными заголовками авторизации
+            response = requests.put(url, params=params, headers=self.headers, timeout=self.timeout)
+            
+            # 201 - создано, 409 - папка уже существует (оба варианта для нас успешны)
+            if response.status_code == 201 or response.status_code == 409:
+                logging.info(f"Папка '{folder_name}' успешно подготовлена.")
+                return True
+                
+            print(f"\n[Диагностика Папки] Статус-код: {response.status_code}")
+            print(f"[Диагностика Папки] Ответ сервера: {response.text}")
+            return False
+        except requests.exceptions.RequestException as err:
+            logging.error(f"Ошибка при создании папки на Я.Диске: {err}")
+            return False
+
+    def upload_by_url(self, folder_name, file_name, file_url):
+        """Загружает файл на Яндекс.Диск 'по воздуху' через URL (метод POST)."""
+        url = f"{self.BASE_URL}/resources/upload"
+        path_in_disk = f"{folder_name}/{file_name}"
+        params = {
+            "path": path_in_disk,
+            "url": file_url
+        }
+
+        logging.info(f"Запуск асинхронной загрузки файла '{file_name}' по воздуху через POST")
+        try:
+            # Для загрузки по URL Яндекс.Диск жестко требует метод POST
+            response = requests.post(url, params=params, headers=self.headers, timeout=self.timeout)
+            
+            if response.status_code == 202:
+                logging.info(f"Файл '{file_name}' успешно принят Я.Диском на загрузку.")
+                return True
+            
+            print(f"\n[Диагностика Загрузки] Статус-код: {response.status_code}")
+            print(f"[Диагностика Загрузки] Ответ сервера: {response.text}")
+            return False
+        except requests.exceptions.RequestException as err:
+            logging.error(f"Ошибка при отправке запроса на загрузку в Я.Диск: {err}")
+            return False
+
+    def get_file_meta(self, folder_name, file_name):
+        """Получает метаданные загруженного файла с Яндекс.Диска."""
+        url = f"{self.BASE_URL}/resources"
+        path_in_disk = f"{folder_name}/{file_name}"
+        params = {"path": path_in_disk}
+
+        logging.info(f"Запрос метаданных файла '{path_in_disk}' с Я.Диска")
+        try:
+            response = requests.get(url, params=params, headers=self.headers, timeout=self.timeout)
+            if response.status_code == 200:
+                return response.json()
+            logging.error(f"Не удалось получить метаданные файла. Статус: {response.status_code}")
+            return None
+        except requests.exceptions.RequestException as err:
+            logging.error(f"Ошибка запроса метаданных с Я.Диска: {err}")
+            return None
 
 
 def main():
-    group_name = "PD-AGNT-162"
+    print("--- Программа резервного копирования картинок (v2.2) ---")
 
-    # 1. Входные данные
-    text_input = input("Введите текст для картинки котика: ").strip()
-    token_input = input("Введите актуальный токен Яндекс.Диска (Полигон): ").strip()
+    text = input("Введите text для картинки котика: ").strip()
+    token = input("Введите ваш токен Яндекс.Диска (Полигон): ").strip()
+    group_name = input("Введите название вашей группы в Нетологии: ").strip()
 
-    if not text_input or not token_input:
-        logging.error("Текст или токен не могут быть пустыми!")
-        return
+    if not text or not token or not group_name:
+        print("[Ошибка] Все поля ввода обязательны для заполнения!")
+        sys.exit(1)
 
-    # 2. Получаем ссылку на котика
     cat_client = CatAPIClient()
-    cat_data = cat_client.get_cat_url(text_input)
+    ya_uploader = YandexDiskUploader(token)
 
-    # Строго формируем правильное имя файла .jpg
-    file_name = f"{text_input}.jpg"
+    with tqdm(total=4, desc="Резервное копирование") as pbar:
+        
+        # Этап 1: Получение стабильного URL картинки
+        pbar.set_postfix_str("Получение ссылки")
+        img_url = cat_client.get_cat_url(text)
+        if not img_url:
+            print("\n[Критическая ошибка] Не удалось получить рабочую ссылку от CATAAS. Завершение.")
+            sys.exit(1)
+        pbar.update(1)
 
-    # 3. Инициализируем клиент Яндекс.Диска
-    y = yadisk.YaDisk(token=token_input)
+        file_name = f"{text}.jpg"
 
-    # Проверяем авторизацию токена
-    if not y.check_token():
-        logging.error("Введенный токен недействителен!")
-        return
+        # Этап 2: Создание папки на Я.Диске через прямой PUT
+        pbar.set_postfix_str("Создание папки")
+        if not ya_uploader.create_folder(group_name):
+            print("\n[Критическая ошибка] Не удалось создать или проверить папку на Яндекс.Диске. Завершение.")
+            sys.exit(1)
+        pbar.update(1)
 
-    # 4. Создаем свою папку на Я.Диске
-    path_folder = f"/{group_name}"
-    try:
-        if not y.exists(path_folder):
-            logging.info(f"Создание папки '{group_name}' на Яндекс.Диске...")
-            y.mkdir(path_folder)
-            logging.info(f"Папка '{group_name}' успешно создана.")
+        # Этап 3: Загрузка "по воздуху" через проверенный POST
+        pbar.set_postfix_str("Загрузка по воздуху")
+        if not ya_uploader.upload_by_url(group_name, file_name, img_url):
+            print("\n[Критическая ошибка] Яндекс.Диск отклонил запрос на загрузку файла. Завершение.")
+            sys.exit(1)
+        pbar.update(1)
+
+        # Этап 4: Запрос точного размера у Я.Диска и запись отчета
+        pbar.set_postfix_str("Фиксация метаданных")
+        file_meta = ya_uploader.get_file_meta(group_name, file_name)
+        if not file_meta:
+            print("\n[Предупреждение] Файл отправлен, но Яндекс.Диск еще обрабатывает его размер.")
+            file_size = "unknown (processing)"
         else:
-            logging.info(f"Папка '{group_name}' уже существует.")
-    except Exception as e:
-        logging.error(f"Не удалось подготовить папку: {e}")
-        return
+            file_size = file_meta.get("size", 0)
+        pbar.update(1)
 
-    # 5. Загрузка картинки «по воздуху» напрямую серверами Яндекса по ссылке
-    full_path = f"{path_folder}/{file_name}"
-    logging.info(f"Отправка команды загрузки файла '{file_name}' по воздуху...")
-    
-    try:
-        # Загружаем напрямую по URL-адресу. Самый безопасный метод на macOS!
-        y.upload_url(cat_data["url"], full_path, overwrite=True)
-        
-        # Небольшая пауза, чтобы Яндекс успел обработать очередь загрузки
-        time.sleep(2)
-        logging.info(f"Файл '{file_name}' успешно сохранен на вашем Яндекс.Диске!")
-        
-        # 6. Сохранить отчетный json файл
-        result_info = [{
-            "file_name": file_name,
-            "size_bytes": cat_data["size"]
-        }]
+    # Запись итогового отчета
+    result_data = [{
+        "file_name": file_name,
+        "size": file_size
+    }]
 
-        json_filename = "upload_result.json"
-        with open(json_filename, "w", encoding="utf-8") as f:
-            json.dump(result_info, f, ensure_ascii=False, indent=4)
+    json_output_path = "upload_report.json"
+    with open(json_output_path, "w", encoding="utf-8") as f:
+        json.dump(result_data, f, ensure_ascii=False, indent=4)
 
-        logging.info(f"Информация о загрузке успешно сохранена в файл {json_filename}")
-
-    except Exception as e:
-        logging.error(f"Ошибка при передаче файла по URL: {e}")
+    print(f"\n[Успех] Котик успешно отправлен в облако '{group_name}/{file_name}'!")
+    print(f"[Информация] Отчет сохранен в: '{json_output_path}'")
 
 
 if __name__ == "__main__":
